@@ -1,0 +1,80 @@
+API Documentation Template
+
+Page Title: [Your API Name] - API Documentation
+
+Overview
+
+Provide a brief description of the API here.
+
+	•	API Name: [Your API Name]
+	•	Version: [Current Version]
+	•	Base URL: https://api.example.com/
+	•	Description: Explain the purpose of the API, what functionality it provides, and who might use it.
+	•	Authentication: Detail the method of authentication (e.g., API keys, OAuth tokens).
+
+Authentication
+
+	•	Method: [e.g., API Key, OAuth]
+	•	Steps:
+	1.	How to obtain an API key/token.
+	2.	Required headers (e.g., Authorization: Bearer {token}).
+
+Example:
+<add example>
+
+Endpoints
+
+1. Endpoint Name 1
+
+	•	Method: GET, POST, etc.
+	•	Endpoint: /v1/resource
+	•	Description: A brief explanation of what this endpoint does.
+
+Request Parameters
+<add table w/ request params>
+
+Sample Request
+<add sample request>
+
+Response
+
+	•	Status Code: 200 OK
+	•	Body Example:
+<add sample response>
+
+Error Codes
+<add table with error codes>
+
+2. Endpoint Name 2
+
+(Repeat the same structure for each additional endpoint)
+
+Rate Limits
+
+Explain any rate limits applied to API requests.
+
+	•	Limit: [e.g., 100 requests per minute]
+	•	Over-limit response: What happens when a limit is exceeded (e.g., status code 429 Too Many Requests).
+
+Error Codes
+
+Provide a general overview of the most common error codes the API might return.
+<add table with error codes>
+
+Changelog
+
+	•	v1.0: Initial release.
+	•	v1.1: Added a new endpoint /v1/new-endpoint.
+
+FAQ
+
+	•	How do I authenticate?
+Provide a concise answer to common questions about authentication.
+	•	What is the rate limit for this API?
+Answer rate limit questions or other common concerns.
+
+Contact Information
+
+Provide information on how users can contact support if they have questions about the API.
+
+This Confluence structure ensures that the documentation is easy to navigate and use. You can adjust sections based on the specific needs of the API. Make sure to use Confluence’s formatting options, like code blocks and tables, for readability.
