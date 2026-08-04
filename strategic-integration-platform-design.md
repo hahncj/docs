@@ -24,17 +24,22 @@ Eventual consistency is acceptable for writes. Multiple experiences and multiple
 ## Core Architectural Decision: Two Distinct, Separable Designs
 
 ### 1. Strategic Integration Platform
-A shared, cross-cutting, protocol-agnostic **durable invocation platform** that domain teams use to reliably call mainframe screens/transactions. Scope:
+A shared, cross-cutting, protocol-agnostic **durable invocation capability** that domain teams use to reliably call mainframe screens/transactions. It's implemented as two parts, not one monolithic service:
+
+- An **integration runtime**, deployed alongside every domain service instance (as a sidecar or embedded library), that holds the actual TCP/IP and REST protocol clients and talks to each mainframe directly — this is the data plane, and it scales with domain service replica count rather than bottlenecking on a single shared process.
+- A smaller **central coordination service** that owns only the shared state the runtime instances need to agree on — window calendar/availability status, circuit-breaker signal aggregation, the saga state store, the idempotency ledger, and the invocation tracking store. This is the control plane; it's not in the hot path of any individual mainframe call.
+
+Scope, regardless of which part implements it:
 
 - Durable invocation primitive: persist a call (target system, protocol, payload, idempotency key), execute it, track status, retry on transient failure
-- **Window-awareness**: knows each mainframe's batch-window calendar; queues calls durably when the target system is in a batch window, dispatches when the window reopens
-- **Protocol execution**: maintains TCP/IP and REST clients/connections to each mainframe; domain teams choose the channel per call, platform handles the plumbing
+- **Window-awareness**: a composite, dynamically-maintained availability status per mainframe (static calendar + active health checks + event-driven signals — see Design Detail below), cached locally by each runtime instance so the check doesn't require a remote call; durably queues calls when the target system is unavailable, dispatches when it reopens
+- **Protocol execution**: each runtime instance maintains its own TCP/IP and REST clients/connections to the mainframes it needs; domain teams choose the channel per call, the runtime handles the plumbing
 - **State persistence for multi-step sequences**: supports a saga correlation ID so a domain's multi-call sequence can resume mid-way after an interruption (e.g., a batch window closing between calls)
 - **Idempotency guarantees** so retries/resumes can't double-apply changes on the mainframe
 - **Circuit breaking / bulkheading** per mainframe connection
-- **Observability**: unified logging/tracing/status dashboard across all domain teams' mainframe calls
+- **Observability**: unified logging/tracing/status dashboard across all domain teams' mainframe calls, built from events emitted by every runtime instance
 
-**Explicitly out of scope for the platform:**
+**Explicitly out of scope:**
 - Business/domain logic (which screens to call, in what order, with what data) — owned by domain teams
 - Compensation logic for partial failures — owned by domain teams
 - Inter-domain communication (REST/GraphQL/Kafka between domain APIs) — uses standard modern resilience patterns, does not route through this platform, since domain APIs don't have batch-window/green-screen fragility
@@ -62,14 +67,14 @@ Neither CDC nor the daily EOD/BOD file transfers pass through the Strategic Inte
 
 ## Write Path (summary)
 
-Command → durable outbox with idempotency key → window-aware dispatcher (immediate dispatch if window open; durable queue-and-resume if closed) → domain-owned saga executes ordered screen-calls via the Strategic Integration Platform → status updates surfaced to caller via tracking ID → mainframe response is the only thing that ever means "confirmed," since the mainframe remains the legal book of record.
+Command → durable outbox with idempotency key → the runtime's window-aware dispatch logic (immediate dispatch if the target mainframe is available; durable local queue-and-resume if not) → domain-owned saga executes ordered screen-calls via the Strategic Integration Platform's runtime → status updates surfaced to caller via tracking ID → mainframe response is the only thing that ever means "confirmed," since the mainframe remains the legal book of record.
 
 ## Layered Architecture (full stack, top to bottom)
 
 1. **Experience layer** — web/mobile/advisor UIs, talk only to their BFFs
 2. **Domain APIs** — one or more per bounded context; own their data end-to-end; communicate with each other via standard modern protocols
 3. **Screen-client libraries** — owned per domain, one client per mainframe screen/transaction that domain's data touches, regardless of which of the 3-4 mainframes it lives on
-4. **Strategic Integration Platform** — cross-cutting durable invocation, retry, idempotency, window-awareness, circuit breaking, observability
+4. **Strategic Integration Platform** — cross-cutting durable invocation, retry, idempotency, window-awareness, circuit breaking, observability; runs as a distributed integration runtime (sidecar or embedded library) alongside each domain service, backed by a lightweight central coordination service for shared state
 5. **Read-side projection** — CDC → normalization → event backbone → real-time store, owned per domain, feeding query APIs
 6. **Mainframes** — sole legal book of record; all writes eventually land here, even if asynchronously
 
@@ -79,43 +84,59 @@ Command → durable outbox with idempotency key → window-aware dispatcher (imm
 
 *Focused on Layer 3 (screen-client libraries) and Layer 4 (the platform itself), and how they interact.*
 
-### Deployment Model: Platform as a Standalone Service (Option B)
+### Deployment Model: Distributed Data Plane, Centralized Control Plane
 
-Decided: the platform is a **standalone, network-addressable service**, not a library embedded in each domain service.
+A single centralized service that proxies all mainframe I/O was considered and ruled out: routing every domain team's mainframe calls through one process creates a central point of failure and a scaling bottleneck. The design instead separates the **data plane** (the actual bytes going to/from the mainframe) from the **control plane** (the shared state that governs whether/how a call proceeds):
 
-- Domain services call the platform remotely (REST and/or events — see below).
-- The platform is the one that actually talks to each mainframe, including through the API Gateway.
-- At the gateway, mainframe-bound calls present as coming from the **platform's own service identity** (one cert/service account), not from individual domain services.
-- Per-domain attribution for audit/logging is preserved via an on-behalf-of header/claim (e.g. `X-Origin-Domain`) that the platform forwards, separate from gateway-level auth.
+- An **integration runtime**, deployed alongside every domain service instance, holds the actual TCP/IP and REST protocol clients and **talks to the mainframe directly** — no network hop through a central process. Mainframe I/O now scales with domain service replica count instead of one shared service's capacity.
+- The runtime subscribes to a lightweight status broadcast (window state, circuit breaker state) per `targetSystem` and caches it **locally, in-memory**. Window-checks and circuit-breaker-checks become local cache reads, not remote calls — this is what actually removes the bottleneck.
+- The runtime checks idempotency against a shared, fast key-value store before dispatch (a KV lookup, not a proxy of the mainframe conversation itself).
+- The runtime emits invocation lifecycle events (accepted/dispatched/completed/failed) to the central tracking store **asynchronously** — the tracking store is a read model built from events, not a gate the call passes through live.
+- When a window is closed, the runtime holds the call in a **local durable queue**, retrying dispatch on its own next local check.
 
-This is what makes centralized window-awareness, circuit-breaking, and idempotency state possible — there is one process managing that state, not N independent library instances that would otherwise need to share state through a database anyway.
+**A much smaller central coordination service** now owns only:
+- The window calendar and health-check polling, broadcasting status changes to every runtime instance
+- Circuit-breaker signal aggregation, if trips should be a shared signal protecting the mainframe holistically rather than purely local per-instance (open design choice — see below)
+- The saga/correlation state store and invocation tracking store, populated by events, queried for `getStatus`/`resume`/the dashboard — a read-heavy service, not in the hot path of any mainframe call
+- The idempotency ledger, as its own lightweight, highly-available store (e.g. Redis/DynamoDB-class), not bundled into a monolithic platform process
+
+**Deployment packaging of the runtime — sidecar vs. embedded library — is supported as either, not a forced choice.** Screen-clients always talk to "the integration runtime" through one local interface contract; they don't know or care whether that's an in-process function call (embedded library) or a localhost call to a colocated process (sidecar). Two ways to keep both modes consistent: build one core implementation with two packagings (most consistent, more upfront engineering investment), or maintain independent per-mode implementations governed by a shared conformance test suite (cheaper to start, only stays consistent if the suite is actually enforced). Sidecar is the presumed default (polyglot, independently upgradable without a domain team's release cycle); embedded library is an explicit escape hatch for teams where sidecar resource overhead doesn't work.
+
+**Gateway identity:** if using the sidecar packaging, the sidecar can hold the platform's shared service identity/cert — distributed via existing secrets infra, kept out of domain application code — so mainframe-bound calls can still present a consistent "platform" identity at the gateway even though execution is now distributed across every pod. This keeps a centralized gateway identity without routing every call through one shared process. (An embedded library instance would need its own path to this credential, which may weaken this guarantee — see open questions.)
+
+**Resilience posture: the central coordination service being unreachable must not stop domain services from making mainframe calls.**
+- **Window/circuit status:** the runtime dispatches on its last-known cached status, or attempts the call blind if no cached status exists yet (e.g. cold start during an outage). This is lower-risk than it sounds: the mainframe itself is the actual enforcement point for batch windows — a dispatch during an actually-closed window is rejected by the mainframe and handled like any other transient failure by the existing retry policy. The platform's window-awareness was always an efficiency optimization, not the thing preventing an incorrect write.
+- **Circuit breaking specifically needs more nuance than blanket fail-open:** if central aggregation is unreachable, each runtime instance should fall back to tracking its own recent failures against that mainframe rather than assuming "no signal = healthy" — otherwise a genuinely struggling mainframe gets hammered by every instance simultaneously the moment the shared signal goes dark, which is the exact failure mode circuit breaking exists to prevent.
+- **Idempotency-store unavailability is a different risk class**, flagged as an open action item below rather than folded into the same fail-open policy, since skipping that check risks double-applying a mainframe write — a correctness problem, not just a wasted-call problem.
 
 ### Screen-Client Libraries: Where They Live
 
-Screen-clients remain **domain-owned code, deployed as part of each domain service** (a library/package), not components running inside the platform. This holds under Option B — the screen-client runs inside the domain service's process and makes a network call out to the platform.
+Screen-clients remain **domain-owned code, deployed as part of each domain service** (a library/package), not components running inside the platform. The screen-client runs inside the domain service's process and calls the local integration runtime — an in-process function call if embedded-library mode, or a localhost call if sidecar mode — rather than a network hop to a remote platform service.
 
 - Screen-client responsibilities: request building, response parsing, error translation — all mainframe-screen-specific.
-- Platform responsibilities: durability, retry, window-awareness, idempotency, circuit breaking, protocol execution, observability — all transport/reliability-specific, with zero knowledge of what a payload *means*.
-- The platform treats `screenPayload` as an opaque blob. It does not need to know screen/transaction type — window-awareness is scoped **per mainframe system**, not per screen.
+- Runtime/platform responsibilities: durability, retry, window-awareness, idempotency, circuit breaking, protocol execution, observability — all transport/reliability-specific, with zero knowledge of what a payload *means*.
+- The runtime treats `screenPayload` as an opaque blob. It does not need to know screen/transaction type — window-awareness is scoped **per mainframe system**, not per screen.
 
 #### OpenAPI / codegen implications
 
 Where a mainframe exposes an OpenAPI spec (REST channel only — not applicable to TCP/IP screens), codegen splits into two concerns:
 
 1. **Mainframe's spec → models only** (request/response types), not a transport client. The generated transport client pointed at the mainframe's host no longer applies, since the domain service doesn't call the mainframe directly.
-2. **Platform's own spec → full generated client** (`invoke`, `getStatus`, `resume`). This is now the actual network-called API domain teams codegen against.
+2. **Runtime's own spec → full generated client** (`invoke`, `getStatus`, `resume`). This is now the actual API domain teams codegen against — a local call (in-process for embedded-library mode, localhost for sidecar mode) rather than a call to a remote shared service.
 
-TCP/IP screens have no OpenAPI spec to begin with; those screen-clients are presumably hand-built or generated from copybooks/schemas already, and that doesn't change with the platform in the middle.
+TCP/IP screens have no OpenAPI spec to begin with; those screen-clients are presumably hand-built or generated from copybooks/schemas already, and that doesn't change with the runtime in the middle.
 
 ### The `invoke` Contract
 
-#### Entry Point 1 — REST
+The shape below is unchanged from the original design — what's changed is *where* it's implemented: this is now the local integration runtime's interface (a localhost call for sidecar mode, a direct function call for embedded-library mode), not a call to a remote standalone service. The two entry points still matter, since a domain service may still prefer submitting via its own local event bus over a direct call, even though both are now handled by a runtime instance colocated with that same domain service.
+
+#### Entry Point 1 — Synchronous call (REST-shaped)
 ```
-POST /invocations
+POST /invocations   (sidecar: localhost call · embedded library: direct function call)
 {
   targetSystem:        string,          // e.g. "mainframe-1"
   protocol:            "tcpip" | "rest",
-  screenPayload:        bytes/base64,    // opaque to the platform
+  screenPayload:        bytes/base64,    // opaque to the runtime
   idempotencyKey:       string,          // scoped per screen-step, caller-generated
   sagaCorrelationId:    string,          // ties together one saga's invocation chain
   executionMode:        "async" | "sync-fail-fast"   // default: "async"
@@ -124,7 +145,7 @@ POST /invocations
 
 #### Entry Point 2 — Event (async mode only)
 ```
-topic: platform.invocations.submit
+topic: integration-runtime.invocations.submit
 {
   targetSystem, protocol, screenPayload,
   idempotencyKey, sagaCorrelationId
@@ -169,14 +190,14 @@ Event: no synchronous response — the accepted event is the ack
 #### Event Lifecycle (async calls)
 
 ```
-1. platform.invocations.accepted
+1. integration-runtime.invocations.accepted
    { invocationId, sagaCorrelationId }
    — emitted immediately on durable receipt, for ALL async calls
-     (REST and event-submitted alike, for consistency — even though
-     REST callers also get this info synchronously in the 202 body)
+     (synchronous-call and event-submitted alike, for consistency — even
+     though synchronous callers also get this info in the immediate response)
 
-2. platform.invocations.completed  { invocationId, sagaCorrelationId, status: "succeeded", result }
-   platform.invocations.failed     { invocationId, sagaCorrelationId, status: "failed", reason }
+2. integration-runtime.invocations.completed  { invocationId, sagaCorrelationId, status: "succeeded", result }
+   integration-runtime.invocations.failed     { invocationId, sagaCorrelationId, status: "failed", reason }
    — emitted once, when the call actually resolves
 ```
 
@@ -197,10 +218,10 @@ These were discussed at a high level; each needs a follow-up deep-dive pass.
 #### Window / Availability Status
 Not a static calendar lookup alone — a **composite, dynamically-maintained status per `targetSystem`**, fed by three sources:
 - **Defined windows** (static config) — known recurring/scheduled batch outages
-- **Active health checks** — platform polls each mainframe ("are you up") on a regular interval, independent of the calendar; catches unplanned outages and windows that overran
-- **Event-driven status** — for mainframes that emit their own up/down signals, the platform subscribes and updates status immediately
+- **Active health checks** — the central coordination service polls each mainframe ("are you up") on a regular interval, independent of the calendar; catches unplanned outages and windows that overran
+- **Event-driven status** — for mainframes that emit their own up/down signals, the coordination service subscribes and updates status immediately
 
-All three resolve to one current status per system, which is what the window-check pipeline step queries — it doesn't matter which source produced it.
+All three resolve to one current status per system, broadcast out to every runtime instance and cached locally — the window-check step in each runtime is a local cache read, and it doesn't matter which source produced the status it's reading.
 
 **Open question:** should an early "available" signal (health check or event) actually resume dispatch before the calendar's official window-open time, or does the calendar remain authoritative for *when* a window officially opens regardless of what health checks say? This is a real behavioral decision, not just a reporting nuance — revisit before implementation.
 
@@ -228,6 +249,10 @@ All three resolve to one current status per system, which is what the window-che
 5. `resume()` response shape
 6. `getStatus` response shape — mirror the completed/failed event payload, or leaner?
 7. Whether to standardize a common status/tracking API shape across domains for the CQRS command side, or let each domain team design it independently
+8. **[OPEN — ACTION ITEM] Idempotency-store failure behavior:** if the shared idempotency store is unreachable, should the runtime reject the call outright with a distinct reason (e.g. `reason: "idempotency_unverifiable"`), or is some other fallback acceptable? Unlike window/circuit status, this cannot simply fail open — skipping the check risks double-applying a mainframe write. Needs an explicit decision before implementation, not a default inherited from the fail-open policy on availability status.
+9. Sidecar vs. embedded-library packaging: build once with two packagings, or maintain independent implementations against a shared conformance test suite? Also affects whether embedded-library instances get the same gateway-identity handling as sidecars, or need a separate credential path.
+10. Circuit-breaker aggregation: centrally aggregated (holistic protection of the mainframe across all domains, dependent on the coordination service) vs. fully local per-runtime-instance (simpler, no shared dependency, less protective when one domain's traffic alone is enough to degrade a mainframe)
+11. How locally-held durable queues (per runtime instance) reconcile into the central tracking store/dashboard for a fleet-wide view of pending calls
 
 ## Next Steps
 
